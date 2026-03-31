@@ -241,12 +241,11 @@ def bytes_to_pil(data: bytes) -> Image.Image:
 
 def run_flux_edit(client, image: Image.Image, prompt: str, strength: float, aspect: str) -> Image.Image:
     """Use flux-kontext-pro for prompt-based image editing."""
-    img_bytes = pil_to_bytes(image)
     output = client.run(
         "black-forest-labs/flux-kontext-pro",
         input={
             "prompt": prompt,
-            "input_image": img_bytes,
+            "input_image": image_to_data_uri(image),
             "output_format": "png",
             "safety_tolerance": 6,
             "aspect_ratio": aspect,
@@ -264,10 +263,9 @@ def run_flux_edit(client, image: Image.Image, prompt: str, strength: float, aspe
 
 def run_remove_bg(client, image: Image.Image) -> Image.Image:
     """Remove background using rembg model."""
-    img_bytes = pil_to_bytes(image)
     output = client.run(
         "cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad23d33ae76a054bc1485d555f",
-        input={"image": img_bytes}
+        input={"image": image_to_data_uri(image)}
     )
     if hasattr(output, 'read'):
         return Image.open(io.BytesIO(output.read())).convert("RGBA")
@@ -278,10 +276,9 @@ def run_remove_bg(client, image: Image.Image) -> Image.Image:
 
 def run_upscale(client, image: Image.Image) -> Image.Image:
     """Upscale image using Real-ESRGAN."""
-    img_bytes = pil_to_bytes(image)
     output = client.run(
         "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
-        input={"image": img_bytes, "scale": 2, "face_enhance": False}
+        input={"image": image_to_data_uri(image), "scale": 2, "face_enhance": False}
     )
     if hasattr(output, 'read'):
         return bytes_to_pil(output.read())
