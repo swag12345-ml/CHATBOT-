@@ -268,7 +268,7 @@ def run_flux_edit(hf_token: str, image: Image.Image, prompt: str, strength: floa
         }
     }
     resp = requests.post(
-        "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix",
+        "https://router.huggingface.co/hf-inference/models/timbrooks/instruct-pix2pix",
         headers={**headers, "Content-Type": "application/json"},
         data=json.dumps(payload),
         timeout=120,
@@ -290,7 +290,7 @@ def run_flux_edit(hf_token: str, image: Image.Image, prompt: str, strength: floa
         }
     }
     resp2 = requests.post(
-        "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5",
+        "https://router.huggingface.co/hf-inference/models/runwayml/stable-diffusion-v1-5",
         headers={**headers, "Content-Type": "application/json"},
         data=json.dumps(payload2),
         timeout=120,
@@ -307,7 +307,7 @@ def run_remove_bg(hf_token: str, image: Image.Image) -> Image.Image:
     img_bytes = pil_to_bytes(image)
     headers = {"Authorization": f"Bearer {hf_token}"}
     resp = requests.post(
-        "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
+        "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4",
         headers=headers,
         data=img_bytes,
         timeout=120,
@@ -325,7 +325,7 @@ def run_upscale(hf_token: str, image: Image.Image) -> Image.Image:
     img_bytes = pil_to_bytes(image)
     headers = {"Authorization": f"Bearer {hf_token}"}
     resp = requests.post(
-        "https://api-inference.huggingface.co/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
         headers=headers,
         data=img_bytes,
         timeout=120,
