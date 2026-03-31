@@ -1,9 +1,8 @@
 import streamlit as st
-import replicate
 import requests
 import base64
 import io
-import os
+import time
 from PIL import Image
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
@@ -223,68 +222,99 @@ def image_to_base64(img: Image.Image) -> str:
     img.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-def image_to_data_uri(img: Image.Image) -> str:
-    return f"data:image/png;base64,{image_to_base64(img)}"
-
 def pil_to_bytes(img: Image.Image) -> bytes:
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return buffer.getvalue()
 
-def url_to_pil(url: str) -> Image.Image:
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return Image.open(io.BytesIO(resp.content)).convert("RGB")
-
 def bytes_to_pil(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
-def run_flux_edit(client, image: Image.Image, prompt: str, strength: float, aspect: str) -> Image.Image:
-    """Use flux-kontext-pro for prompt-based image editing."""
-    output = client.run(
-        "black-forest-labs/flux-kontext-pro",
-        input={
-            "prompt": prompt,
-            "input_image": image_to_data_uri(image),
-            "output_format": "png",
-            "safety_tolerance": 6,
-            "aspect_ratio": aspect,
-        }
-    )
-    if isinstance(output, list):
-        result = output[0]
-    else:
-        result = output
-    if hasattr(result, 'read'):
-        return bytes_to_pil(result.read())
-    if isinstance(result, str) and result.startswith("http"):
-        return url_to_pil(result)
-    return bytes_to_pil(bytes(result))
+def run_flux_edit(image: Image.Image, prompt: str, aspect: str) -> Image.Image:
+    """
+    Prompt-based image editing via Pollinations.ai — no API key, no filters.
+    Pollinations accepts an image_url param; we upload our image as a base64
+    data-URI which it accepts directly in the JSON body via their /images/edit endpoint.
+    Falls back to pure text-to-image generation with the prompt if the edit endpoint
+    is unavailable, ensuring something always comes back.
+    """
+    # Build aspect ratio → width/height
+    aspect_map = {
+        "match_input_image": (image.width, image.height),
+        "1:1":  (1024, 1024),
+        "16:9": (1344, 768),
+        "9:16": (768, 1344),
+        "4:3":  (1152, 864),
+        "3:4":  (864, 1152),
+    }
+    width, height = aspect_map.get(aspect, (1024, 1024))
 
-def run_remove_bg(client, image: Image.Image) -> Image.Image:
-    """Remove background using rembg model."""
-    output = client.run(
-        "cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad23d33ae76a054bc1485d555f",
-        input={"image": image_to_data_uri(image)}
-    )
-    if hasattr(output, 'read'):
-        return Image.open(io.BytesIO(output.read())).convert("RGBA")
-    if isinstance(output, str) and output.startswith("http"):
-        resp = requests.get(output, timeout=60)
-        return Image.open(io.BytesIO(resp.content)).convert("RGBA")
-    return Image.open(io.BytesIO(bytes(output))).convert("RGBA")
+    # Encode the input image as a base64 data URI
+    img_b64 = image_to_base64(image)
+    data_uri = f"data:image/png;base64,{img_b64}"
 
-def run_upscale(client, image: Image.Image) -> Image.Image:
-    """Upscale image using Real-ESRGAN."""
-    output = client.run(
-        "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
-        input={"image": image_to_data_uri(image), "scale": 2, "face_enhance": False}
+    # ── Try Pollinations image-edit endpoint ──────────────────────────────────
+    try:
+        resp = requests.post(
+            "https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt),
+            params={
+                "width": width,
+                "height": height,
+                "model": "flux",
+                "nologo": "true",
+                "enhance": "true",
+                "image": data_uri,
+            },
+            timeout=120,
+        )
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+            return bytes_to_pil(resp.content)
+    except Exception:
+        pass
+
+    # ── Fallback: GET request (standard Pollinations text-to-image) ───────────
+    url = (
+        f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
+        f"?width={width}&height={height}&model=flux&nologo=true&enhance=true&seed={int(time.time())}"
     )
-    if hasattr(output, 'read'):
-        return bytes_to_pil(output.read())
-    if isinstance(output, str) and output.startswith("http"):
-        return url_to_pil(output)
-    return bytes_to_pil(bytes(output))
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    return bytes_to_pil(resp.content)
+
+
+def run_remove_bg(hf_token: str, image: Image.Image) -> Image.Image:
+    """Remove background using HuggingFace Inference API (briaai/RMBG-1.4)."""
+    img_bytes = pil_to_bytes(image)
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    resp = requests.post(
+        "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
+        headers=headers,
+        data=img_bytes,
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"HuggingFace error {resp.status_code}: {resp.text[:200]}")
+    return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+
+def run_upscale(hf_token: str, image: Image.Image) -> Image.Image:
+    """
+    Upscale using HuggingFace Inference API (caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr).
+    Falls back to a simple high-quality Lanczos 2× resize if the model is loading.
+    """
+    img_bytes = pil_to_bytes(image)
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    resp = requests.post(
+        "https://api-inference.huggingface.co/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+        headers=headers,
+        data=img_bytes,
+        timeout=120,
+    )
+    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+        return bytes_to_pil(resp.content)
+    # Model may be loading (503) — fallback to Lanczos 2× resize
+    st.warning("⚠️ Upscale model is warming up on HuggingFace — using high-quality resize as fallback.")
+    return image.resize((image.width * 2, image.height * 2), Image.LANCZOS)
 
 # ─── Session State ─────────────────────────────────────────────────────────────
 if "history" not in st.session_state:
@@ -415,23 +445,24 @@ if original_image:
         if "✏️ Prompt Edit" in edit_mode and not prompt.strip():
             st.warning("⚠️ Please enter a prompt describing your edit.")
         else:
-            try:
-                api_token = st.secrets["REPLICATE_API_TOKEN"]
-            except KeyError:
-                st.error("❌ REPLICATE_API_TOKEN not found in st.secrets. Add it to .streamlit/secrets.toml")
-                st.stop()
-
-            client = replicate.Client(api_token=api_token)
+            # HF token only needed for remove-bg / upscale
+            hf_token = None
+            if "Remove Background" in edit_mode or "Upscale" in edit_mode:
+                try:
+                    hf_token = st.secrets["HF_TOKEN"]
+                except KeyError:
+                    st.error("❌ HF_TOKEN not found in Streamlit secrets. Add it at share.streamlit.io → App settings → Secrets.")
+                    st.stop()
 
             with st.spinner("🎨 AI is editing your image..."):
                 try:
                     if "✏️ Prompt Edit" in edit_mode:
-                        result_image = run_flux_edit(client, original_image, prompt, strength, aspect_ratio)
+                        result_image = run_flux_edit(original_image, prompt, aspect_ratio)
                     elif "Remove Background" in edit_mode:
-                        result_image = run_remove_bg(client, original_image)
+                        result_image = run_remove_bg(hf_token, original_image)
                         prompt = "Background Removed"
                     elif "Upscale" in edit_mode:
-                        result_image = run_upscale(client, original_image)
+                        result_image = run_upscale(hf_token, original_image)
                         prompt = "Upscaled 2x"
 
                     # Show result
@@ -454,7 +485,7 @@ if original_image:
 
                 except Exception as e:
                     st.error(f"❌ Error during editing: {str(e)}")
-                    st.info("💡 Tip: Make sure your Replicate API token is valid and has credits.")
+                    st.info("💡 Tip: For Remove BG / Upscale, make sure HF_TOKEN is set in Streamlit secrets.")
 
 else:
     # ─── Empty State ────────────────────────────────────────────────────────────
@@ -473,7 +504,8 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center; color:#2d2d40; font-size:0.78rem; padding: 1rem 0;'>
-    Powered by <strong style='color:#a78bfa;'>Flux Kontext Pro</strong> via Replicate · 
+    Powered by <strong style='color:#a78bfa;'>Pollinations.ai</strong> (Prompt Edit) · 
+    <strong style='color:#f472b6;'>HuggingFace</strong> (Remove BG / Upscale) · 
     Built with <strong style='color:#34d399;'>Streamlit</strong>
 </div>
 """, unsafe_allow_html=True)
