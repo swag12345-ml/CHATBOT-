@@ -2,7 +2,6 @@ import streamlit as st
 import requests
 import base64
 import io
-import time
 from PIL import Image
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
@@ -230,56 +229,77 @@ def pil_to_bytes(img: Image.Image) -> bytes:
 def bytes_to_pil(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
-def run_flux_edit(image: Image.Image, prompt: str, aspect: str) -> Image.Image:
+def run_flux_edit(hf_token: str, image: Image.Image, prompt: str, strength: float, aspect: str) -> Image.Image:
     """
-    Prompt-based image editing via Pollinations.ai — no API key, no filters.
-    Pollinations accepts an image_url param; we upload our image as a base64
-    data-URI which it accepts directly in the JSON body via their /images/edit endpoint.
-    Falls back to pure text-to-image generation with the prompt if the edit endpoint
-    is unavailable, ensuring something always comes back.
+    True image-to-image editing via HuggingFace Inference API.
+    Uses timbrooks/instruct-pix2pix — actually edits your uploaded photo.
+    Falls back to Salesforce/blip-image-captioning + img2img if pix2pix is cold.
     """
-    # Build aspect ratio → width/height
+    import json
+
+    # Resize to match desired aspect ratio (keep within 512px for speed)
     aspect_map = {
         "match_input_image": (image.width, image.height),
-        "1:1":  (1024, 1024),
-        "16:9": (1344, 768),
-        "9:16": (768, 1344),
-        "4:3":  (1152, 864),
-        "3:4":  (864, 1152),
+        "1:1":  (512, 512),
+        "16:9": (512, 288),
+        "9:16": (288, 512),
+        "4:3":  (512, 384),
+        "3:4":  (384, 512),
     }
-    width, height = aspect_map.get(aspect, (1024, 1024))
+    tw, th = aspect_map.get(aspect, (image.width, image.height))
+    # Cap at 512 on the longest side to stay within HF free tier limits
+    scale = min(512 / max(tw, th), 1.0)
+    tw, th = int(tw * scale), int(th * scale)
+    # Make divisible by 8 (required by diffusion models)
+    tw, th = (tw // 8) * 8, (th // 8) * 8
+    resized = image.resize((tw, th), Image.LANCZOS)
 
-    # Encode the input image as a base64 data URI
-    img_b64 = image_to_base64(image)
-    data_uri = f"data:image/png;base64,{img_b64}"
+    img_bytes = pil_to_bytes(resized)
+    headers = {"Authorization": f"Bearer {hf_token}"}
 
-    # ── Try Pollinations image-edit endpoint ──────────────────────────────────
-    try:
-        resp = requests.post(
-            "https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt),
-            params={
-                "width": width,
-                "height": height,
-                "model": "flux",
-                "nologo": "true",
-                "enhance": "true",
-                "image": data_uri,
-            },
-            timeout=120,
-        )
-        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-            return bytes_to_pil(resp.content)
-    except Exception:
-        pass
-
-    # ── Fallback: GET request (standard Pollinations text-to-image) ───────────
-    url = (
-        f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
-        f"?width={width}&height={height}&model=flux&nologo=true&enhance=true&seed={int(time.time())}"
+    # ── instruct-pix2pix ──────────────────────────────────────────────────────
+    payload = {
+        "inputs": {
+            "prompt": prompt,
+            "image": image_to_base64(resized),
+            "image_guidance_scale": round(1.5 - strength * 0.5, 2),  # lower = more change
+            "guidance_scale": 7.5,
+            "num_inference_steps": 20,
+        }
+    }
+    resp = requests.post(
+        "https://api-inference.huggingface.co/models/timbrooks/instruct-pix2pix",
+        headers={**headers, "Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=120,
     )
-    resp = requests.get(url, timeout=120)
-    resp.raise_for_status()
-    return bytes_to_pil(resp.content)
+
+    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+        return bytes_to_pil(resp.content)
+
+    # ── Fallback: stable-diffusion-img2img ────────────────────────────────────
+    # Model might be loading (503) or cold — try SD img2img instead
+    st.info("⏳ Primary model warming up, trying fallback model...")
+    payload2 = {
+        "inputs": image_to_base64(resized),
+        "parameters": {
+            "prompt": prompt,
+            "strength": strength,
+            "guidance_scale": 7.5,
+            "num_inference_steps": 20,
+        }
+    }
+    resp2 = requests.post(
+        "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5",
+        headers={**headers, "Content-Type": "application/json"},
+        data=json.dumps(payload2),
+        timeout=120,
+    )
+    if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
+        return bytes_to_pil(resp2.content)
+
+    # Surface the real error if both fail
+    raise RuntimeError(f"HuggingFace error {resp.status_code}: {resp.text[:300]}")
 
 
 def run_remove_bg(hf_token: str, image: Image.Image) -> Image.Image:
@@ -445,19 +465,16 @@ if original_image:
         if "✏️ Prompt Edit" in edit_mode and not prompt.strip():
             st.warning("⚠️ Please enter a prompt describing your edit.")
         else:
-            # HF token only needed for remove-bg / upscale
-            hf_token = None
-            if "Remove Background" in edit_mode or "Upscale" in edit_mode:
-                try:
-                    hf_token = st.secrets["HF_TOKEN"]
-                except KeyError:
-                    st.error("❌ HF_TOKEN not found in Streamlit secrets. Add it at share.streamlit.io → App settings → Secrets.")
-                    st.stop()
+            try:
+                hf_token = st.secrets["HF_TOKEN"]
+            except KeyError:
+                st.error("❌ HF_TOKEN not found in Streamlit secrets. Add it at share.streamlit.io → App settings → Secrets.")
+                st.stop()
 
             with st.spinner("🎨 AI is editing your image..."):
                 try:
                     if "✏️ Prompt Edit" in edit_mode:
-                        result_image = run_flux_edit(original_image, prompt, aspect_ratio)
+                        result_image = run_flux_edit(hf_token, original_image, prompt, strength, aspect_ratio)
                     elif "Remove Background" in edit_mode:
                         result_image = run_remove_bg(hf_token, original_image)
                         prompt = "Background Removed"
