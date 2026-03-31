@@ -1,7 +1,9 @@
 import streamlit as st
+import replicate
 import requests
 import base64
 import io
+import os
 from PIL import Image
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
@@ -221,120 +223,68 @@ def image_to_base64(img: Image.Image) -> str:
     img.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+def image_to_data_uri(img: Image.Image) -> str:
+    return f"data:image/png;base64,{image_to_base64(img)}"
+
 def pil_to_bytes(img: Image.Image) -> bytes:
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return buffer.getvalue()
 
+def url_to_pil(url: str) -> Image.Image:
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
 def bytes_to_pil(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert("RGB")
 
-def run_flux_edit(hf_token: str, image: Image.Image, prompt: str, strength: float, aspect: str) -> Image.Image:
-    """
-    True image-to-image editing via HuggingFace Inference API.
-    Uses timbrooks/instruct-pix2pix — actually edits your uploaded photo.
-    Falls back to Salesforce/blip-image-captioning + img2img if pix2pix is cold.
-    """
-    import json
-
-    # Resize to match desired aspect ratio (keep within 512px for speed)
-    aspect_map = {
-        "match_input_image": (image.width, image.height),
-        "1:1":  (512, 512),
-        "16:9": (512, 288),
-        "9:16": (288, 512),
-        "4:3":  (512, 384),
-        "3:4":  (384, 512),
-    }
-    tw, th = aspect_map.get(aspect, (image.width, image.height))
-    # Cap at 512 on the longest side to stay within HF free tier limits
-    scale = min(512 / max(tw, th), 1.0)
-    tw, th = int(tw * scale), int(th * scale)
-    # Make divisible by 8 (required by diffusion models)
-    tw, th = (tw // 8) * 8, (th // 8) * 8
-    resized = image.resize((tw, th), Image.LANCZOS)
-
-    img_bytes = pil_to_bytes(resized)
-    headers = {"Authorization": f"Bearer {hf_token}"}
-
-    # ── instruct-pix2pix ──────────────────────────────────────────────────────
-    payload = {
-        "inputs": {
+def run_flux_edit(client, image: Image.Image, prompt: str, strength: float, aspect: str) -> Image.Image:
+    """Use flux-kontext-pro for prompt-based image editing."""
+    output = client.run(
+        "black-forest-labs/flux-kontext-pro",
+        input={
             "prompt": prompt,
-            "image": image_to_base64(resized),
-            "image_guidance_scale": round(1.5 - strength * 0.5, 2),  # lower = more change
-            "guidance_scale": 7.5,
-            "num_inference_steps": 20,
+            "input_image": image_to_data_uri(image),
+            "output_format": "png",
+            "safety_tolerance": 6,
+            "aspect_ratio": aspect,
         }
-    }
-    resp = requests.post(
-        "https://router.huggingface.co/hf-inference/models/timbrooks/instruct-pix2pix",
-        headers={**headers, "Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=120,
     )
+    if isinstance(output, list):
+        result = output[0]
+    else:
+        result = output
+    if hasattr(result, 'read'):
+        return bytes_to_pil(result.read())
+    if isinstance(result, str) and result.startswith("http"):
+        return url_to_pil(result)
+    return bytes_to_pil(bytes(result))
 
-    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-        return bytes_to_pil(resp.content)
-
-    # ── Fallback: stable-diffusion-img2img ────────────────────────────────────
-    # Model might be loading (503) or cold — try SD img2img instead
-    st.info("⏳ Primary model warming up, trying fallback model...")
-    payload2 = {
-        "inputs": image_to_base64(resized),
-        "parameters": {
-            "prompt": prompt,
-            "strength": strength,
-            "guidance_scale": 7.5,
-            "num_inference_steps": 20,
-        }
-    }
-    resp2 = requests.post(
-        "https://router.huggingface.co/hf-inference/models/runwayml/stable-diffusion-v1-5",
-        headers={**headers, "Content-Type": "application/json"},
-        data=json.dumps(payload2),
-        timeout=120,
+def run_remove_bg(client, image: Image.Image) -> Image.Image:
+    """Remove background using rembg model."""
+    output = client.run(
+        "cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad23d33ae76a054bc1485d555f",
+        input={"image": image_to_data_uri(image)}
     )
-    if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
-        return bytes_to_pil(resp2.content)
+    if hasattr(output, 'read'):
+        return Image.open(io.BytesIO(output.read())).convert("RGBA")
+    if isinstance(output, str) and output.startswith("http"):
+        resp = requests.get(output, timeout=60)
+        return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+    return Image.open(io.BytesIO(bytes(output))).convert("RGBA")
 
-    # Surface the real error if both fail
-    raise RuntimeError(f"HuggingFace error {resp.status_code}: {resp.text[:300]}")
-
-
-def run_remove_bg(hf_token: str, image: Image.Image) -> Image.Image:
-    """Remove background using HuggingFace Inference API (briaai/RMBG-1.4)."""
-    img_bytes = pil_to_bytes(image)
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    resp = requests.post(
-        "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4",
-        headers=headers,
-        data=img_bytes,
-        timeout=120,
+def run_upscale(client, image: Image.Image) -> Image.Image:
+    """Upscale image using Real-ESRGAN."""
+    output = client.run(
+        "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+        input={"image": image_to_data_uri(image), "scale": 2, "face_enhance": False}
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"HuggingFace error {resp.status_code}: {resp.text[:200]}")
-    return Image.open(io.BytesIO(resp.content)).convert("RGBA")
-
-
-def run_upscale(hf_token: str, image: Image.Image) -> Image.Image:
-    """
-    Upscale using HuggingFace Inference API (caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr).
-    Falls back to a simple high-quality Lanczos 2× resize if the model is loading.
-    """
-    img_bytes = pil_to_bytes(image)
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    resp = requests.post(
-        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
-        headers=headers,
-        data=img_bytes,
-        timeout=120,
-    )
-    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-        return bytes_to_pil(resp.content)
-    # Model may be loading (503) — fallback to Lanczos 2× resize
-    st.warning("⚠️ Upscale model is warming up on HuggingFace — using high-quality resize as fallback.")
-    return image.resize((image.width * 2, image.height * 2), Image.LANCZOS)
+    if hasattr(output, 'read'):
+        return bytes_to_pil(output.read())
+    if isinstance(output, str) and output.startswith("http"):
+        return url_to_pil(output)
+    return bytes_to_pil(bytes(output))
 
 # ─── Session State ─────────────────────────────────────────────────────────────
 if "history" not in st.session_state:
@@ -466,20 +416,22 @@ if original_image:
             st.warning("⚠️ Please enter a prompt describing your edit.")
         else:
             try:
-                hf_token = st.secrets["HF_TOKEN"]
+                api_token = st.secrets["REPLICATE_API_TOKEN"]
             except KeyError:
-                st.error("❌ HF_TOKEN not found in Streamlit secrets. Add it at share.streamlit.io → App settings → Secrets.")
+                st.error("❌ REPLICATE_API_TOKEN not found in st.secrets. Add it to .streamlit/secrets.toml")
                 st.stop()
+
+            client = replicate.Client(api_token=api_token)
 
             with st.spinner("🎨 AI is editing your image..."):
                 try:
                     if "✏️ Prompt Edit" in edit_mode:
-                        result_image = run_flux_edit(hf_token, original_image, prompt, strength, aspect_ratio)
+                        result_image = run_flux_edit(client, original_image, prompt, strength, aspect_ratio)
                     elif "Remove Background" in edit_mode:
-                        result_image = run_remove_bg(hf_token, original_image)
+                        result_image = run_remove_bg(client, original_image)
                         prompt = "Background Removed"
                     elif "Upscale" in edit_mode:
-                        result_image = run_upscale(hf_token, original_image)
+                        result_image = run_upscale(client, original_image)
                         prompt = "Upscaled 2x"
 
                     # Show result
@@ -502,7 +454,7 @@ if original_image:
 
                 except Exception as e:
                     st.error(f"❌ Error during editing: {str(e)}")
-                    st.info("💡 Tip: For Remove BG / Upscale, make sure HF_TOKEN is set in Streamlit secrets.")
+                    st.info("💡 Tip: Make sure your Replicate API token is valid and has credits.")
 
 else:
     # ─── Empty State ────────────────────────────────────────────────────────────
@@ -521,8 +473,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center; color:#2d2d40; font-size:0.78rem; padding: 1rem 0;'>
-    Powered by <strong style='color:#a78bfa;'>Pollinations.ai</strong> (Prompt Edit) · 
-    <strong style='color:#f472b6;'>HuggingFace</strong> (Remove BG / Upscale) · 
+    Powered by <strong style='color:#a78bfa;'>Flux Kontext Pro</strong> via Replicate · 
     Built with <strong style='color:#34d399;'>Streamlit</strong>
 </div>
 """, unsafe_allow_html=True)
